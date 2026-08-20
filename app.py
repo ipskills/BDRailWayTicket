@@ -1,200 +1,185 @@
 import streamlit as st
+import streamlit.components.v1 as components
 from railway_api import RailwayAPI
 from datetime import datetime, timedelta
 
-st.set_page_config(
-    page_title="BD Railway E-Ticket",
-    page_icon="train",
-    layout="wide",
-)
-
-st.title("BD Railway E-Ticket Service")
+st.set_page_config(page_title="BD Railway E-Ticket", page_icon="train", layout="wide")
 
 if "api" not in st.session_state:
     st.session_state.api = RailwayAPI()
-    st.session_state.api.handshake()
 
 api = st.session_state.api
 
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-    st.session_state.otp_sent = False
-    st.session_state.mobile = ""
+if "phase" not in st.session_state:
+    st.session_state.phase = "landing"
 
-st.sidebar.title("Navigation")
+phase = st.session_state.phase
 
-if not st.session_state.logged_in:
+if phase == "landing":
+    components.html(
+        """
+        <html>
+        <head><style>
+            body { margin:0; padding:0; font-family: Arial, sans-serif; }
+            .hero {
+                background: linear-gradient(135deg, #1976d2 0%, #0d47a1 100%);
+                color: white; text-align: center; padding: 60px 20px;
+                min-height: 100vh; display: flex; flex-direction: column;
+                justify-content: center; align-items: center;
+            }
+            h1 { font-size: 42px; margin-bottom: 10px; }
+            p { font-size: 18px; opacity: 0.9; margin-bottom: 30px; }
+            .url-box {
+                background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.3);
+                border-radius: 8px; padding: 12px 24px; font-size: 16px;
+                color: white; margin-bottom: 30px; cursor: pointer; text-decoration: none;
+            }
+            .url-box:hover { background: rgba(255,255,255,0.25); }
+        </style></head>
+        <body>
+            <div class="hero">
+                <h1>Bangladesh Railway</h1>
+                <p>E-Ticketing Service - Search Trains & View Seat Availability</p>
+                <a href="https://eticket.railway.gov.bd" target="_blank" class="url-box">
+                    eticket.railway.gov.bd
+                </a>
+            </div>
+        </body>
+        </html>
+        """,
+        height=600,
+    )
+
+    if st.button("Continue to App", type="primary", use_container_width=True):
+        st.session_state.phase = "login"
+        st.rerun()
+
+elif phase == "login":
     st.subheader("Login to Bangladesh Railway")
+    st.caption("Enter your Railway website phone and password")
 
-    mobile = st.text_input("Mobile Number", placeholder="01XXXXXXXXX", value=st.session_state.mobile)
+    if "login_error" not in st.session_state:
+        st.session_state.login_error = ""
 
-    if not st.session_state.otp_sent:
-        if st.button("Send OTP", use_container_width=True):
-            if len(mobile) != 11 or not mobile.startswith("01"):
-                st.error("Enter a valid 11-digit mobile number starting with 01")
+    if st.session_state.login_error:
+        st.error(st.session_state.login_error)
+        st.session_state.login_error = ""
+
+    mobile = st.text_input("Phone Number", placeholder="01XXXXXXXXX", max_chars=11)
+    password = st.text_input("Password", type="password", placeholder="Your Railway password")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Login", type="primary", use_container_width=True):
+            if not mobile or not password:
+                st.error("Enter phone and password")
+            elif len(mobile) != 11:
+                st.error("Enter valid 11-digit phone number")
             else:
-                with st.spinner("Sending OTP..."):
-                    result = api.request_otp(mobile)
+                with st.spinner("Logging in to Bangladesh Railway..."):
+                    result = api.login(mobile, password)
                 if result["success"]:
-                    st.session_state.otp_sent = True
-                    st.session_state.mobile = mobile
-                    st.success(result["message"])
+                    st.session_state.phase = "dashboard"
                     st.rerun()
                 else:
-                    st.error(result["message"])
-    else:
-        st.info(f"OTP sent to {mobile}")
-        otp = st.text_input("Enter OTP", placeholder="6-digit code", max_chars=6)
+                    st.session_state.login_error = result["message"]
+                    st.rerun()
 
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Verify OTP", use_container_width=True):
-                if len(otp) != 6:
-                    st.error("Enter a valid 6-digit OTP")
-                else:
-                    with st.spinner("Verifying..."):
-                        result = api.verify_otp(mobile, otp)
-                    if result["success"]:
-                        st.session_state.logged_in = True
-                        st.success("Login successful!")
-                        st.rerun()
-                    else:
-                        st.error(result["message"])
-        with col2:
-            if st.button("Resend OTP", use_container_width=True):
-                with st.spinner("Resending..."):
-                    result = api.request_otp(mobile)
-                if result["success"]:
-                    st.success("OTP resent!")
-                else:
-                    st.error(result["message"])
+    with c2:
+        if st.button("Open Railway Website", use_container_width=True):
+            components.html(
+                '<script>window.open("https://eticket.railway.gov.bd/login", "_blank");</script>',
+                height=0,
+            )
 
-        if st.button("Back", use_container_width=True):
-            st.session_state.otp_sent = False
-            st.rerun()
+    st.divider()
+    st.info("Login with the same phone and password you use on eticket.railway.gov.bd")
 
-else:
-    st.success("Logged in to Bangladesh Railway")
-    if st.sidebar.button("Logout from Railway"):
-        api.auth_token = None
-        st.session_state.logged_in = False
-        st.session_state.otp_sent = False
+elif phase == "dashboard":
+    st.sidebar.title("BD Railway")
+    st.sidebar.success("Logged In")
+    if st.sidebar.button("Logout", use_container_width=True):
+        api.close()
+        st.session_state.phase = "landing"
         st.rerun()
 
     st.subheader("Search Trains")
 
     cities = api.cities
-    city_names = [c.get("name", c.get("city_name", "")) for c in cities] if cities else []
-    city_codes = [c.get("code", c.get("city_code", "")) for c in cities] if cities else []
+    city_names = [c.get("name", "") for c in cities] if cities else []
+    city_codes = [c.get("code", "") for c in cities] if cities else []
 
-    col1, col2, col3 = st.columns(3)
+    c1, c2, c3 = st.columns(3)
 
-    with col1:
+    with c1:
         if city_names:
-            from_idx = st.selectbox("From Station", range(len(city_names)), format_func=lambda i: city_names[i])
+            from_idx = st.selectbox("From", range(len(city_names)), format_func=lambda i: city_names[i], key="from")
             from_station = city_codes[from_idx] if city_codes else city_names[from_idx]
         else:
-            from_station = st.text_input("From Station Code", placeholder="e.g., DHK")
-            st.caption("Enter station code manually")
+            from_station = st.text_input("From Station", placeholder="e.g. DHK")
 
-    with col2:
+    with c2:
         if city_names:
-            to_idx = st.selectbox("To Station", range(len(city_names)), format_func=lambda i: city_names[i])
+            to_idx = st.selectbox("To", range(len(city_names)), format_func=lambda i: city_names[i], key="to")
             to_station = city_codes[to_idx] if city_codes else city_names[to_idx]
         else:
-            to_station = st.text_input("To Station Code", placeholder="e.g., CTG")
-            st.caption("Enter station code manually")
+            to_station = st.text_input("To Station", placeholder="e.g. CTG")
 
-    with col3:
+    with c3:
         tomorrow = datetime.now() + timedelta(days=1)
-        travel_date = st.date_input("Travel Date", value=tomorrow, min_value=datetime.now())
+        travel_date = st.date_input("Date", value=tomorrow, min_value=datetime.now())
         date_str = travel_date.strftime("%Y-%m-%d")
 
-    seat_types = ["SHOVAN", "SHOVAN_CHAIR", "SNIGDHA", "TURNTA", "AC_SEAT", "AC_BERTH", "FIRST_CLASS"]
-    seat_type = st.selectbox("Seat Type", seat_types)
-
-    if st.button("Search Trains", use_container_width=True, type="primary"):
-        with st.spinner("Searching for trains..."):
-            result = api.search_trips(from_station, to_station, date_str, seat_type)
+    if st.button("Search", type="primary", use_container_width=True):
+        with st.spinner("Searching trains..."):
+            result = api.search_trips(from_station, to_station, date_str)
 
         if result["success"]:
             trains = result["trains"]
             if trains:
-                st.subheader(f"Available Trains ({len(trains)} found)")
-
+                st.subheader(f"Found {len(trains)} Train(s)")
                 for train in trains:
-                    with st.expander(f"Train: {train.get('train_name', train.get('name', 'Unknown'))}"):
-                        col1, col2, col3 = st.columns(3)
+                    with st.expander(train.get("name", "Train")):
+                        st.write(train.get("info", "No details"))
+                        st.write(f"**Route:** {from_station} -> {to_station}")
+                        st.write(f"**Date:** {date_str}")
 
-                        with col1:
-                            st.write(f"**Train No:** {train.get('train_number', train.get('number', 'N/A'))}")
-                            st.write(f"**Train Name:** {train.get('train_name', train.get('name', 'N/A'))}")
-
-                        with col2:
-                            st.write(f"**Departure:** {train.get('departure_time', train.get('depart_time', 'N/A'))}")
-                            st.write(f"**Arrival:** {train.get('arrival_time', train.get('arrive_time', 'N/A'))}")
-
-                        with col3:
-                            st.write(f"**Duration:** {train.get('duration', 'N/A')}")
-                            st.write(f"**Available:** {train.get('available_seats', train.get('seats_available', 'N/A'))}")
-
-                        fare = train.get("fare", train.get("ticket_price", "N/A"))
-                        st.write(f"**Fare:** {fare} BDT")
-
-                        if st.button(
-                            "Check Seats",
-                            key=f"seat_{train.get('train_id', train.get('id', ''))}_{train.get('trip_id', '')}",
-                        ):
-                            with st.spinner("Loading seat layout..."):
-                                seat_result = api.get_seat_layout(
-                                    str(train.get("train_id", train.get("id", ""))),
-                                    str(train.get("trip_id", "")),
-                                    date_str,
-                                    seat_type,
-                                )
-
+                        tid = train.get("id", "")
+                        if tid and st.button("View Seats", key=f"seat_{tid}"):
+                            with st.spinner("Loading seats..."):
+                                seat_result = api.get_seat_layout(tid, date_str)
                             if seat_result["success"]:
                                 layout = seat_result["layout"]
-                                st.json(layout)
+
+                                if layout.get("classes"):
+                                    st.write("**Seat Classes:**")
+                                    for cls in layout["classes"]:
+                                        st.write(f"- {cls['name']}")
+
+                                if layout.get("seats"):
+                                    blank = [s for s in layout["seats"] if s["available"]]
+                                    booked = [s for s in layout["seats"] if not s["available"]]
+                                    if blank:
+                                        st.success(f"**Blank Seats ({len(blank)}):** {', '.join(s['number'] for s in blank[:50])}")
+                                    if booked:
+                                        st.error(f"**Booked Seats ({len(booked)}):** {', '.join(s['number'] for s in booked[:20])}...")
+                                else:
+                                    st.json(layout)
                             else:
                                 st.error(seat_result["message"])
             else:
-                st.warning("No trains found for this route and date.")
+                st.warning("No trains found")
         else:
             st.error(result["message"])
 
     st.divider()
-    st.subheader("Quick Train List")
 
-    with st.spinner("Loading train information..."):
-        info_result = api.get_train_info()
-
-    if info_result["success"] and info_result["trains"]:
-        trains_info = info_result["trains"]
-        st.write(f"Total trains in system: {len(trains_info)}")
-
-        search_query = st.text_input("Search train by name or number", placeholder="e.g., SUBORNO, 701")
-        if search_query:
-            filtered = [
-                t for t in trains_info
-                if search_query.lower() in str(t.get("train_name", t.get("name", ""))).lower()
-                or search_query in str(t.get("train_number", t.get("number", "")))
-            ]
-        else:
-            filtered = trains_info[:20]
-
-        if filtered:
-            for t in filtered:
-                st.write(
-                    f"**{t.get('train_number', t.get('number', ''))}** - "
-                    f"{t.get('train_name', t.get('name', ''))} | "
-                    f"Route: {t.get('route', t.get('from_station', ''))} → {t.get('destination', t.get('to_station', ''))}"
-                )
-    elif not info_result["success"]:
-        st.warning("Could not load train information.")
-
-st.sidebar.divider()
-st.sidebar.markdown("**BD Railway E-Ticket**")
-st.sidebar.markdown("View train schedules and seat availability.")
-st.sidebar.markdown("---")
-st.sidebar.markdown("Powered by Bangladesh Railway API")
+    with st.expander("All Trains on Route"):
+        if st.button("Load All Trains", key="load_all"):
+            with st.spinner("Loading..."):
+                result = api.search_trips(from_station, to_station, date_str)
+                if result["success"] and result["trains"]:
+                    for t in result["trains"]:
+                        st.write(f"**{t.get('name', 'Unknown')}** - {t.get('info', '')}")
+                else:
+                    st.info("No trains found")

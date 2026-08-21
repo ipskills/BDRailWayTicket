@@ -1,80 +1,107 @@
 import time
+import json
 import logging
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
 
 logger = logging.getLogger(__name__)
 RAILWAY_URL = "https://eticket.railway.gov.bd"
+API_URL = "https://railspaapi.shohoz.com/v1.0/web"
 
 
 class RailwayAPI:
     def __init__(self):
-        self.driver = None
+        self.browser = None
         self.logged_in = False
         self.cities = []
+        self.token = None
 
-    def _make_driver(self):
-        opts = Options()
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--window-size=1920,1080")
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension", False)
-        opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-        svc = Service(ChromeDriverManager().install())
-        drv = webdriver.Chrome(service=svc, options=opts)
-        drv.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"})
-        drv.implicitly_wait(5)
-        return drv
+    def _start_browser(self):
+        from DrissionPage import ChromiumPage, ChromiumOptions
+
+        co = ChromiumOptions()
+        co.headless()
+        co.set_argument("--no-sandbox")
+        co.set_argument("--disable-dev-shm-usage")
+        co.set_argument("--disable-gpu")
+        co.set_argument("--window-size=1920,1080")
+        co.set_argument("--disable-blink-features=AutomationControlled")
+        co.set_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+        page = ChromiumPage(co)
+        return page
 
     def login(self, mobile, password):
         try:
-            self.driver = self._make_driver()
-            self.driver.get(f"{RAILWAY_URL}/login")
-            time.sleep(4)
-            wait = WebDriverWait(self.driver, 20)
+            self.browser = self._start_browser()
+            self.browser.get(f"{RAILWAY_URL}/login")
+            time.sleep(5)
 
-            mobile_el = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='text'],input[type='tel'],input[placeholder*='Mobile'],input[placeholder*='phone']")))
-            mobile_el.clear()
-            mobile_el.send_keys(mobile)
+            mobile_el = self.browser.ele("css:input[type='text'], input[type='tel'], input[placeholder*='Mobile'], input[placeholder*='phone']")
+            if mobile_el:
+                mobile_el.clear()
+                mobile_el.input(mobile)
 
-            pass_el = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='password']")))
-            pass_el.clear()
-            pass_el.send_keys(password)
+            pass_el = self.browser.ele("css:input[type='password']")
+            if pass_el:
+                pass_el.clear()
+                pass_el.input(password)
 
             time.sleep(1)
-            btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit'],button.btn-primary")))
-            btn.click()
-            time.sleep(6)
 
-            if "login" not in self.driver.current_url.lower():
+            btn = self.browser.ele("css:button[type='submit'], button.btn-primary")
+            if btn:
+                btn.click()
+
+            time.sleep(8)
+
+            url = self.browser.url
+            if "login" not in url.lower():
                 self.logged_in = True
+                self._extract_token()
                 self._load_cities()
                 return {"success": True, "message": "Login successful"}
 
             errors = []
-            for e in self.driver.find_elements(By.CSS_SELECTOR, ".error,.alert-danger,[class*='error'],.toast-message"):
-                t = e.text.strip()
-                if t:
-                    errors.append(t)
+            try:
+                for e in self.browser.eles("css:.error, .alert-danger, [class*='error'], .toast-message"):
+                    t = e.text.strip()
+                    if t:
+                        errors.append(t)
+            except Exception:
+                pass
+
             return {"success": False, "message": " | ".join(errors) if errors else "Login failed. Check credentials."}
         except Exception as e:
             return {"success": False, "message": str(e)}
 
+    def _extract_token(self):
+        try:
+            js = """
+            (function() {
+                let keys = ['token', 'auth_token', 'accessToken', 'access_token'];
+                for (let key of keys) {
+                    let val = localStorage.getItem(key);
+                    if (val) return val;
+                }
+                for (let i = 0; i < localStorage.length; i++) {
+                    let key = localStorage.key(i);
+                    let val = localStorage.getItem(key);
+                    if (val && val.length > 50 && val.includes('.')) return val;
+                }
+                return null;
+            })()
+            """
+            self.token = self.browser.run_js(js)
+        except Exception:
+            pass
+
     def _load_cities(self):
         try:
-            self.driver.get(f"{RAILWAY_URL}/home")
+            self.browser.get(f"{RAILWAY_URL}/home")
             time.sleep(3)
             self.cities = []
-            for sel in self.driver.find_elements(By.CSS_SELECTOR, "select"):
-                for opt in sel.find_elements(By.TAG_NAME, "option"):
-                    val = opt.get_attribute("value")
+            for sel in self.browser.eles("css:select"):
+                for opt in sel.eles("tag:option"):
+                    val = opt.attr("value")
                     txt = opt.text.strip()
                     if val and txt and len(txt) > 1 and txt.lower() not in ("select", "from", "to", "choose"):
                         self.cities.append({"name": txt, "code": val})
@@ -83,36 +110,71 @@ class RailwayAPI:
         except Exception:
             pass
 
+    def _api_headers(self):
+        h = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Origin": "https://eticket.railway.gov.bd",
+            "Referer": "https://eticket.railway.gov.bd/",
+        }
+        if self.token:
+            h["Authorization"] = f"Bearer {self.token}"
+        return h
+
     def search_trips(self, from_station, to_station, date):
         if not self.logged_in:
             return {"success": False, "message": "Not logged in"}
+
+        if self.token:
+            import requests
+            try:
+                resp = requests.get(
+                    f"{API_URL}/bookings/search-trips-v2",
+                    params={"from_city": from_station, "to_city": to_station, "date": date, "seat_type": 1},
+                    headers=self._api_headers(),
+                    timeout=15,
+                )
+                data = resp.json()
+                if resp.status_code == 200:
+                    trips = data.get("data", {}).get("trips", [])
+                    if trips:
+                        return {"success": True, "trains": trips}
+            except Exception:
+                pass
+
         try:
-            self.driver.get(f"{RAILWAY_URL}/home")
+            self.browser.get(f"{RAILWAY_URL}/home")
             time.sleep(3)
-            selects = self.driver.find_elements(By.CSS_SELECTOR, "select")
+
+            selects = self.browser.eles("css:select")
             if len(selects) >= 2:
-                for opt in selects[0].find_elements(By.TAG_NAME, "option"):
+                for opt in selects[0].eles("tag:option"):
                     if from_station.lower() in opt.text.lower():
-                        self.driver.execute_script("arguments[0].value=arguments[1];arguments[0].dispatchEvent(new Event('change'))", selects[0], opt.get_attribute("value"))
+                        selects[0].run_js(f"this.value='{opt.attr('value')}';this.dispatchEvent(new Event('change'))")
                         break
                 time.sleep(1)
-                for opt in selects[1].find_elements(By.TAG_NAME, "option"):
+                for opt in selects[1].eles("tag:option"):
                     if to_station.lower() in opt.text.lower():
-                        self.driver.execute_script("arguments[0].value=arguments[1];arguments[0].dispatchEvent(new Event('change'))", selects[1], opt.get_attribute("value"))
+                        selects[1].run_js(f"this.value='{opt.attr('value')}';this.dispatchEvent(new Event('change'))")
                         break
-            date_inputs = self.driver.find_elements(By.CSS_SELECTOR, "input[type='date']")
+
+            date_inputs = self.browser.eles("css:input[type='date']")
             if date_inputs:
-                self.driver.execute_script("arguments[0].value=arguments[1];arguments[0].dispatchEvent(new Event('input'))", date_inputs[0], date)
-            btns = self.driver.find_elements(By.CSS_SELECTOR, "button[type='submit'],button.btn-search")
+                date_inputs[0].run_js(f"this.value='{date}';this.dispatchEvent(new Event('input'))")
+
+            btns = self.browser.eles("css:button[type='submit'], button.btn-search")
             if btns:
                 btns[0].click()
+
             time.sleep(5)
+
             trains = []
-            for card in self.driver.find_elements(By.CSS_SELECTOR, ".train-list-item,.train-card,[class*='train'],.list-group-item,table tbody tr"):
+            for card in self.browser.eles("css:.train-list-item, .train-card, [class*='train'], .list-group-item, table tbody tr"):
                 txt = card.text.strip()
                 if txt:
                     lines = [l.strip() for l in txt.split("\n") if l.strip()]
-                    trains.append({"name": lines[0], "info": " | ".join(lines[1:]) if len(lines) > 1 else "", "id": card.get_attribute("data-id") or str(len(trains))})
+                    trains.append({"name": lines[0], "info": " | ".join(lines[1:]) if len(lines) > 1 else "", "id": card.attr("data-id") or str(len(trains))})
             return {"success": True, "trains": trains}
         except Exception as e:
             return {"success": False, "message": str(e)}
@@ -121,10 +183,11 @@ class RailwayAPI:
         if not self.logged_in:
             return {"success": False, "message": "Not logged in"}
         try:
-            self.driver.get(f"{RAILWAY_URL}/seat-plan?train={train_id}&date={date}")
+            self.browser.get(f"{RAILWAY_URL}/seat-plan?train={train_id}&date={date}")
             time.sleep(5)
+
             result = {"coaches": []}
-            for tab in self.driver.find_elements(By.CSS_SELECTOR, "[role='tab'],.nav-tab,.mat-tab-label"):
+            for tab in self.browser.eles("css:[role='tab'], .nav-tab, .mat-tab-label"):
                 name = tab.text.strip()
                 if not name:
                     continue
@@ -133,10 +196,11 @@ class RailwayAPI:
                     time.sleep(2)
                 except Exception:
                     pass
+
                 coach = {"name": name, "blank": [], "booked": []}
-                for seat in self.driver.find_elements(By.CSS_SELECTOR, "[class*='seat']"):
+                for seat in self.browser.eles("css:[class*='seat']"):
                     stxt = seat.text.strip()
-                    scls = seat.get_attribute("class") or ""
+                    scls = seat.attr("class") or ""
                     if stxt:
                         if "available" in scls or "blank" in scls or "free" in scls:
                             coach["blank"].append(stxt)
@@ -148,10 +212,10 @@ class RailwayAPI:
             return {"success": False, "message": str(e)}
 
     def close(self):
-        if self.driver:
+        if self.browser:
             try:
-                self.driver.quit()
+                self.browser.quit()
             except Exception:
                 pass
-            self.driver = None
+            self.browser = None
             self.logged_in = False

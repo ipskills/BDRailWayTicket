@@ -16,17 +16,12 @@ if "selected_seats" not in st.session_state:
 if "current_train" not in st.session_state:
     st.session_state.current_train = None
 
-phase = st.session_state.phase
-
 st.markdown("""<style>
     [data-testid="stSidebar"] {background-color: #0e1117}
     .stButton>button {border-radius: 8px; font-weight: 600}
-    .seat-btn {display:inline-block; padding:8px 12px; margin:3px; border-radius:6px; cursor:pointer; font-weight:bold; text-align:center; min-width:45px}
-    .seat-blank {background:#1b5e20; color:white; border:2px solid #4caf50}
-    .seat-booked {background:#b71c1c; color:white; border:2px solid #f44336}
-    .seat-selected {background:#1565c0; color:white; border:2px solid #42a5f5}
 </style>""", unsafe_allow_html=True)
 
+phase = st.session_state.phase
 
 if phase == "login":
     st.title("Bangladesh Railway E-Ticket")
@@ -45,7 +40,7 @@ if phase == "login":
             elif len(mobile) != 11:
                 st.error("Enter valid 11-digit mobile")
             else:
-                with st.spinner("Opening browser and logging in..."):
+                with st.spinner("Logging in to Bangladesh Railway..."):
                     result = api.login(mobile, password)
                 if result["success"]:
                     st.session_state.phase = "dashboard"
@@ -56,10 +51,9 @@ if phase == "login":
     with right:
         st.subheader("How it works")
         st.write("1. Enter your Railway phone & password")
-        st.write("2. Browser opens and logs in automatically")
+        st.write("2. App connects to Railway website automatically")
         st.write("3. Search trains, view blank seats")
         st.write("4. Select multiple seats with one click")
-        st.info("Your credentials are used only to login to Bangladesh Railway website. They are not stored anywhere.")
 
 elif phase == "dashboard":
     with st.sidebar:
@@ -75,10 +69,10 @@ elif phase == "dashboard":
             st.rerun()
         st.divider()
         if st.session_state.selected_seats:
-            st.subheader(f"Selected Seats ({len(st.session_state.selected_seats)})")
+            st.subheader(f"Selected ({len(st.session_state.selected_seats)})")
             for seat in st.session_state.selected_seats:
                 st.write(f"  {seat}")
-            if st.button("Clear Selection", use_container_width=True):
+            if st.button("Clear", use_container_width=True):
                 st.session_state.selected_seats = []
                 st.rerun()
         if st.button("Logout", use_container_width=True):
@@ -88,7 +82,7 @@ elif phase == "dashboard":
             st.rerun()
 
     st.title("Dashboard")
-    st.info("Use the sidebar to navigate. Search trains and view blank seats.")
+    st.info("Use sidebar to navigate. Search trains and view blank seats.")
 
 elif phase == "search":
     with st.sidebar:
@@ -104,11 +98,10 @@ elif phase == "search":
             st.rerun()
         st.divider()
         if st.session_state.selected_seats:
-            st.subheader(f"Selected Seats ({len(st.session_state.selected_seats)})")
+            st.subheader(f"Selected ({len(st.session_state.selected_seats)})")
             for seat in st.session_state.selected_seats:
                 st.write(f"  {seat}")
-            st.write(f"**Total: {len(st.session_state.selected_seats)}**")
-            if st.button("Clear Selection", use_container_width=True):
+            if st.button("Clear", use_container_width=True):
                 st.session_state.selected_seats = []
                 st.rerun()
         if st.button("Logout", use_container_width=True):
@@ -140,10 +133,23 @@ elif phase == "search":
             if trains:
                 st.subheader(f"Found {len(trains)} Train(s)")
                 for train in trains:
-                    with st.expander(train.get("name", "Train")):
-                        st.write(train.get("info", ""))
-                        if st.button("View Blank Seats", key=f"vs_{train.get('id','')}"):
-                            st.session_state.current_train = {"id": train.get("id", ""), "name": train.get("name", ""), "date": date_str}
+                    name = train.get("train_name", train.get("name", "Unknown"))
+                    number = train.get("train_number", train.get("number", ""))
+                    dep = train.get("departure_time", train.get("depart_time", ""))
+                    arr = train.get("arrival_time", train.get("arrive_time", ""))
+                    fare = train.get("fare", train.get("ticket_price", ""))
+                    avail = train.get("available_seats", train.get("seats_available", ""))
+                    tid = str(train.get("train_id", train.get("id", "")))
+                    trip_id = str(train.get("trip_id", ""))
+
+                    with st.expander(f"{number} - {name} | Seats: {avail}"):
+                        cc1, cc2, cc3, cc4 = st.columns(4)
+                        with cc1: st.write(f"**Depart:** {dep}")
+                        with cc2: st.write(f"**Arrive:** {arr}")
+                        with cc3: st.write(f"**Fare:** {fare} BDT")
+                        with cc4: st.write(f"**Available:** {avail}")
+                        if st.button("View Blank Seats", key=f"vs_{tid}_{trip_id}"):
+                            st.session_state.current_train = {"id": tid, "name": name, "date": date_str}
                             st.session_state.phase = "seats"
                             st.rerun()
             else:
@@ -153,7 +159,6 @@ elif phase == "search":
 
 elif phase == "seats":
     train = st.session_state.current_train
-
     with st.sidebar:
         st.title("BD Railway")
         st.success("Logged In")
@@ -177,7 +182,7 @@ elif phase == "seats":
 
     st.title(f"Seats - {train['name']}")
 
-    with st.spinner("Loading seat layout..."):
+    with st.spinner("Loading seats..."):
         result = api.get_seats(train["id"], train["date"])
 
     if result["success"]:
@@ -205,7 +210,7 @@ elif phase == "seats":
                             st.rerun()
 
             if booked:
-                st.error(f"Booked Seats: {len(booked)} - {', '.join(booked[:30])}{'...' if len(booked) > 30 else ''}")
+                st.error(f"Booked: {len(booked)} - {', '.join(booked[:30])}{'...' if len(booked) > 30 else ''}")
     else:
         st.error(result["message"])
 
@@ -228,23 +233,19 @@ elif phase == "alltrains":
             st.rerun()
 
     st.title("All Trains on Route")
+    if api.cities:
+        city_names = [c["name"] for c in api.cities]
+        c1, c2 = st.columns(2)
+        with c1: f_from = st.selectbox("From", city_names, key="af")
+        with c2: f_to = st.selectbox("To", city_names, key="at")
 
-    with st.spinner("Loading trains..."):
-        if api.cities:
-            city_names = [c["name"] for c in api.cities]
-            c1, c2 = st.columns(2)
-            with c1:
-                f_from = st.selectbox("From", city_names, key="af")
-            with c2:
-                f_to = st.selectbox("To", city_names, key="at")
-
-            if st.button("Load Trains", type="primary", use_container_width=True):
-                with st.spinner("Searching..."):
-                    result = api.search_trips(f_from, f_to, datetime.now().strftime("%Y-%m-%d"))
-                if result["success"] and result["trains"]:
-                    for t in result["trains"]:
-                        st.write(f"**{t.get('name', '')}** - {t.get('info', '')}")
-                else:
-                    st.info("No trains found on this route")
-        else:
-            st.warning("No station data available")
+        if st.button("Load Trains", type="primary", use_container_width=True):
+            with st.spinner("Loading..."):
+                result = api.search_trips(f_from, f_to, datetime.now().strftime("%Y-%m-%d"))
+            if result["success"] and result["trains"]:
+                for t in result["trains"]:
+                    st.write(f"**{t.get('name', '')}** - {t.get('info', '')}")
+            else:
+                st.info("No trains found")
+    else:
+        st.warning("No station data")

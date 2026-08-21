@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 from railway_api import RailwayAPI
 from datetime import datetime, timedelta
 
@@ -6,6 +7,7 @@ st.set_page_config(page_title="BD Railway E-Ticket", page_icon="train", layout="
 
 if "api" not in st.session_state:
     st.session_state.api = RailwayAPI()
+    st.session_state.api.handshake()
 
 api = st.session_state.api
 
@@ -15,6 +17,8 @@ if "selected_seats" not in st.session_state:
     st.session_state.selected_seats = []
 if "current_train" not in st.session_state:
     st.session_state.current_train = None
+if "otp_sent" not in st.session_state:
+    st.session_state.otp_sent = False
 
 st.markdown("""<style>
     [data-testid="stSidebar"] {background-color: #0e1117}
@@ -31,29 +35,70 @@ if phase == "login":
 
     with left:
         st.subheader("Login")
-        mobile = st.text_input("Mobile Number", placeholder="01XXXXXXXXX", max_chars=11)
-        password = st.text_input("Password", type="password", placeholder="Enter password")
 
-        if st.button("Login & Start", type="primary", use_container_width=True):
-            if not mobile or not password:
-                st.error("Enter mobile and password")
-            elif len(mobile) != 11:
-                st.error("Enter valid 11-digit mobile")
-            else:
-                with st.spinner("Logging in to Bangladesh Railway..."):
-                    result = api.login(mobile, password)
-                if result["success"]:
-                    st.session_state.phase = "dashboard"
-                    st.rerun()
+        if not st.session_state.otp_sent:
+            mobile = st.text_input("Mobile Number", placeholder="01XXXXXXXXX", max_chars=11)
+
+            st.write("**Verify you are human:**")
+            turnstile_token = components.declare_component("turnstile", path="./components")()
+
+            if st.button("Send OTP", type="primary", use_container_width=True):
+                if not mobile or len(mobile) != 11:
+                    st.error("Enter valid 11-digit mobile")
+                elif not turnstile_token:
+                    st.error("Please complete the verification")
                 else:
-                    st.error(result["message"])
+                    with st.spinner("Sending OTP..."):
+                        result = api.request_otp(mobile, turnstile_token)
+                    if result["success"]:
+                        st.session_state.otp_sent = True
+                        st.session_state.mobile = mobile
+                        st.rerun()
+                    else:
+                        st.error(result["message"])
+
+        else:
+            mobile = st.session_state.mobile
+            st.success(f"OTP sent to {mobile}")
+            otp = st.text_input("Enter OTP Code", placeholder="6-digit code", max_chars=6)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("Verify & Login", type="primary", use_container_width=True):
+                    if len(otp) != 6:
+                        st.error("Enter 6-digit OTP")
+                    else:
+                        with st.spinner("Verifying..."):
+                            result = api.verify_otp(mobile, otp)
+                        if result["success"]:
+                            st.session_state.phase = "dashboard"
+                            st.session_state.otp_sent = False
+                            st.rerun()
+                        else:
+                            st.error(result["message"])
+            with c2:
+                if st.button("Resend OTP", use_container_width=True):
+                    turnstile_token = components.declare_component("turnstile", path="./components")()
+                    if turnstile_token:
+                        with st.spinner("Resending..."):
+                            result = api.request_otp(mobile, turnstile_token)
+                        if result["success"]:
+                            st.success("OTP resent!")
+                        else:
+                            st.error(result["message"])
+
+            if st.button("Back", use_container_width=True):
+                st.session_state.otp_sent = False
+                st.rerun()
 
     with right:
         st.subheader("How it works")
-        st.write("1. Enter your Railway phone & password")
-        st.write("2. App connects to Railway website automatically")
-        st.write("3. Search trains, view blank seats")
-        st.write("4. Select multiple seats with one click")
+        st.write("1. Enter your phone number")
+        st.write("2. Complete the verification")
+        st.write("3. Receive OTP on your phone")
+        st.write("4. Enter OTP to login")
+        st.write("5. Search trains & view blank seats")
+        st.write("6. Select multiple seats with one click")
 
 elif phase == "dashboard":
     with st.sidebar:
@@ -76,7 +121,7 @@ elif phase == "dashboard":
                 st.session_state.selected_seats = []
                 st.rerun()
         if st.button("Logout", use_container_width=True):
-            api.close()
+            api.logout()
             st.session_state.phase = "login"
             st.session_state.selected_seats = []
             st.rerun()
@@ -105,7 +150,7 @@ elif phase == "search":
                 st.session_state.selected_seats = []
                 st.rerun()
         if st.button("Logout", use_container_width=True):
-            api.close()
+            api.logout()
             st.session_state.phase = "login"
             st.session_state.selected_seats = []
             st.rerun()
@@ -114,20 +159,33 @@ elif phase == "search":
 
     cities = api.cities
     city_names = [c["name"] for c in cities] if cities else []
+    city_ids = [str(c["city_id"]) for c in cities] if cities else []
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        from_station = st.selectbox("From", city_names, key="from_s") if city_names else st.text_input("From")
+        if city_names:
+            from_idx = st.selectbox("From", city_names, key="from_s")
+            from_city = city_ids[from_idx]
+        else:
+            from_city = st.text_input("From City ID")
     with c2:
-        to_station = st.selectbox("To", city_names, key="to_s") if city_names else st.text_input("To")
+        if city_names:
+            to_idx = st.selectbox("To", city_names, key="to_s")
+            to_city = city_ids[to_idx]
+        else:
+            to_city = st.text_input("To City ID")
     with c3:
         tomorrow = datetime.now() + timedelta(days=1)
         travel_date = st.date_input("Date", value=tomorrow, min_value=datetime.now())
         date_str = travel_date.strftime("%Y-%m-%d")
 
+    seat_types = {"SHOVAN": 1, "SHOVAN_CHAIR": 2, "SNIGDHA": 3, "TURNTA": 4, "AC_SEAT": 5, "AC_BERTH": 6, "FIRST_CLASS": 7}
+    seat_type_name = st.selectbox("Seat Class", list(seat_types.keys()))
+    seat_type = seat_types[seat_type_name]
+
     if st.button("Search", type="primary", use_container_width=True):
         with st.spinner("Searching trains..."):
-            result = api.search_trips(from_station, to_station, date_str)
+            result = api.search_trips(from_city, to_city, date_str, seat_type)
         if result["success"]:
             trains = result["trains"]
             if trains:
@@ -149,7 +207,7 @@ elif phase == "search":
                         with cc3: st.write(f"**Fare:** {fare} BDT")
                         with cc4: st.write(f"**Available:** {avail}")
                         if st.button("View Blank Seats", key=f"vs_{tid}_{trip_id}"):
-                            st.session_state.current_train = {"id": tid, "name": name, "date": date_str}
+                            st.session_state.current_train = {"id": tid, "name": name, "date": date_str, "seat_type": seat_type}
                             st.session_state.phase = "seats"
                             st.rerun()
             else:
@@ -183,34 +241,52 @@ elif phase == "seats":
     st.title(f"Seats - {train['name']}")
 
     with st.spinner("Loading seats..."):
-        result = api.get_seats(train["id"], train["date"])
+        result = api.get_seat_layout(train["id"], "", train["date"], train.get("seat_type", 1))
 
     if result["success"]:
         layout = result["layout"]
-        for coach in layout.get("coaches", []):
-            name = coach["name"]
-            blank = coach.get("blank", [])
-            booked = coach.get("booked", [])
+        if isinstance(layout, dict):
+            for coach_name, coach_data in layout.items():
+                if not isinstance(coach_data, dict):
+                    continue
+                seats = coach_data.get("seats", coach_data)
+                blank = []
+                booked = []
+                if isinstance(seats, dict):
+                    for seat_no, status in seats.items():
+                        if isinstance(status, bool):
+                            (blank if status else booked).append(seat_no)
+                        elif isinstance(status, str):
+                            (blank if status.lower() in ("available", "free", "blank", "0") else booked).append(seat_no)
+                elif isinstance(seats, list):
+                    for s in seats:
+                        st_val = s.get("status")
+                        s_no = s.get("seat_number", s.get("number", ""))
+                        if st_val in ("available", "free", "blank", False, 0):
+                            blank.append(s_no)
+                        else:
+                            booked.append(s_no)
 
-            st.subheader(f"Coach: {name}")
-
-            if blank:
-                st.success(f"Blank Seats: {len(blank)}")
-                cols = st.columns(min(len(blank), 10))
-                for i, seat_no in enumerate(blank):
-                    col = cols[i % len(cols)]
-                    with col:
-                        is_sel = seat_no in st.session_state.selected_seats
-                        label = f"[X] {seat_no}" if is_sel else seat_no
-                        if st.button(label, key=f"sel_{name}_{seat_no}", use_container_width=True):
-                            if is_sel:
-                                st.session_state.selected_seats.remove(seat_no)
-                            else:
-                                st.session_state.selected_seats.append(seat_no)
-                            st.rerun()
-
-            if booked:
-                st.error(f"Booked: {len(booked)} - {', '.join(booked[:30])}{'...' if len(booked) > 30 else ''}")
+                if blank or booked:
+                    st.subheader(f"Coach: {coach_name}")
+                    if blank:
+                        st.success(f"Blank: {len(blank)} seats")
+                        cols = st.columns(min(len(blank), 10))
+                        for i, seat_no in enumerate(blank):
+                            col = cols[i % len(cols)]
+                            with col:
+                                is_sel = seat_no in st.session_state.selected_seats
+                                label = f"[X] {seat_no}" if is_sel else seat_no
+                                if st.button(label, key=f"sel_{coach_name}_{seat_no}", use_container_width=True):
+                                    if is_sel:
+                                        st.session_state.selected_seats.remove(seat_no)
+                                    else:
+                                        st.session_state.selected_seats.append(seat_no)
+                                    st.rerun()
+                    if booked:
+                        st.error(f"Booked: {len(booked)} - {', '.join(booked[:30])}{'...' if len(booked) > 30 else ''}")
+        else:
+            st.json(layout)
     else:
         st.error(result["message"])
 
@@ -228,24 +304,21 @@ elif phase == "alltrains":
             st.rerun()
         st.divider()
         if st.button("Logout", use_container_width=True):
-            api.close()
+            api.logout()
             st.session_state.phase = "login"
             st.rerun()
 
-    st.title("All Trains on Route")
-    if api.cities:
-        city_names = [c["name"] for c in api.cities]
+    st.title("All Trains")
+    with st.spinner("Loading..."):
+        result = api.get_all_trains()
+    if result["success"]:
+        trains = result["trains"]
+        st.write(f"Total: {len(trains)} trains")
         c1, c2 = st.columns(2)
-        with c1: f_from = st.selectbox("From", city_names, key="af")
-        with c2: f_to = st.selectbox("To", city_names, key="at")
-
-        if st.button("Load Trains", type="primary", use_container_width=True):
-            with st.spinner("Loading..."):
-                result = api.search_trips(f_from, f_to, datetime.now().strftime("%Y-%m-%d"))
-            if result["success"] and result["trains"]:
-                for t in result["trains"]:
-                    st.write(f"**{t.get('name', '')}** - {t.get('info', '')}")
-            else:
-                st.info("No trains found")
-    else:
-        st.warning("No station data")
+        with c1: f_from = st.text_input("Filter origin", placeholder="e.g. Dhaka")
+        with c2: f_to = st.text_input("Filter destination", placeholder="e.g. Chattogram")
+        filtered = trains
+        if f_from: filtered = [t for t in filtered if f_from.lower() in t.get("origin_city", "").lower()]
+        if f_to: filtered = [t for t in filtered if f_to.lower() in t.get("destination_city", "").lower()]
+        for t in filtered:
+            st.write(f"**Train {t.get('train_number', '')}** - {t.get('origin_city', '')} to {t.get('destination_city', '')} ({t.get('zone', '')})")

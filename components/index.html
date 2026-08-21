@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+    <style>
+        body { margin: 0; padding: 10px; font-family: Arial, sans-serif; background: transparent; }
+    </style>
+</head>
+<body>
+    <div id="turnstile" class="cf-turnstile"
+         data-sitekey="0x4AAAAAAB5VTjZ90pUxRuXR"
+         data-callback="onTurnstileSuccess"
+         data-theme="dark">
+    </div>
+    <script>
+    function onTurnstileSuccess(token) {
+        window.parent.Streamlit.setComponentValue(token);
+    }
+    </script>
+</body>
+</html>

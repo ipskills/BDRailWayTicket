@@ -1,10 +1,8 @@
 import requests
-import json
 
 
 class RailwayAPI:
     BASE_URL = "https://railspaapi.shohoz.com/v1.0/web"
-    SITE_URL = "https://eticket.railway.gov.bd"
 
     HEADERS = {
         "Content-Type": "application/json",

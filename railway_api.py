@@ -18,7 +18,6 @@ class RailwayAPI:
         self.session.headers.update(self.HEADERS)
         self.auth_token = None
         self.cities = []
-        self.trains = []
 
     def handshake(self) -> dict:
         try:
@@ -53,7 +52,6 @@ class RailwayAPI:
             data = resp.json()
             if resp.status_code == 200:
                 trains = data.get("data", {}).get("trains", [])
-                self.trains = trains
                 return {"success": True, "trains": trains}
             return {"success": False, "message": "Failed"}
         except Exception as e:

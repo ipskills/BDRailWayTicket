@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 from railway_api import RailwayAPI
 from datetime import datetime, timedelta
 
@@ -10,38 +11,101 @@ if "api" not in st.session_state:
 
 api = st.session_state.api
 
-st.title("Bangladesh Railway E-Ticket")
+if "phase" not in st.session_state:
+    st.session_state.phase = "landing"
+if "token" not in st.session_state:
+    st.session_state.token = ""
 
-logged_in = api.auth_token is not None
+phase = st.session_state.phase
 
-if not logged_in:
-    st.info(
-        "**How to login:**\n"
-        "1. Open [eticket.railway.gov.bd](https://eticket.railway.gov.bd) in a new tab\n"
-        "2. Login with your phone and password\n"
-        "3. Press **F12** on keyboard\n"
-        "4. Go to **Application** tab → **Local Storage** → `eticket.railway.gov.bd`\n"
-        "5. Find `token` or `auth_token` → copy the value\n"
-        "6. Paste it below"
+if phase == "landing":
+    st.title("Bangladesh Railway E-Ticket")
+
+    components.html(
+        """
+        <div style="text-align:center; padding:20px;">
+            <h2 style="color:#1976d2;">Welcome to BD Railway E-Ticket</h2>
+            <p style="font-size:16px; color:#555; margin-bottom:20px;">
+                Login with your phone and password, then search trains
+            </p>
+        </div>
+        """,
+        height=120,
     )
 
-    token = st.text_input("Paste your auth token", placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...")
+    st.info("**Instructions:**\n1. Click **Login to Railway** below\n2. The Railway website loads on the right side\n3. Login with your phone and password\n4. After login, click **Extract My Token**\n5. Then search trains and view seats!")
 
-    if st.button("Login", type="primary", use_container_width=True):
-        if token.strip():
-            with st.spinner("Verifying..."):
-                result = api.set_token(token.strip())
-            if result["success"]:
-                st.success(result["message"])
-                st.rerun()
-            else:
-                st.error(result["message"])
-        else:
-            st.error("Paste your token")
+    if st.button("Login to Railway", type="primary", use_container_width=True):
+        st.session_state.phase = "login"
+        st.rerun()
 
-    st.divider()
+elif phase == "login":
+    st.title("Bangladesh Railway Login")
 
-    st.subheader("All Trains (No Login Needed)")
+    c1, c2 = st.columns([1, 1])
+
+    with c1:
+        st.subheader("Instructions")
+        st.write("1. Login on the right side")
+        st.write("2. Enter your phone and password")
+        st.write("3. Click **Extract Token** after login")
+
+        st.divider()
+
+        token_input = st.text_area(
+            "Or paste token manually (if auto-extract fails):",
+            placeholder="eyJhbGciOiJIUzI1NiIs...",
+            height=80,
+        )
+
+        if st.button("Use This Token", type="primary", use_container_width=True):
+            if token_input.strip():
+                with st.spinner("Verifying..."):
+                    result = api.set_token(token_input.strip())
+                if result["success"]:
+                    st.session_state.token = token_input.strip()
+                    st.session_state.phase = "dashboard"
+                    st.rerun()
+                else:
+                    st.error(result["message"])
+
+        if st.button("Back", use_container_width=True):
+            st.session_state.phase = "landing"
+            st.rerun()
+
+    with c2:
+        st.subheader("Railway Website")
+        st.caption("Login here with phone and password:")
+
+        components.html(
+            """
+            <iframe
+                src="https://eticket.railway.gov.bd/login"
+                style="width:100%; height:600px; border:2px solid #1976d2; border-radius:8px;"
+                frameborder="0"
+                allowfullscreen>
+            </iframe>
+            """,
+            height=640,
+        )
+
+        st.caption("After login, copy token from browser: F12 -> Application -> Local Storage -> eticket.railway.gov.bd -> token")
+
+elif phase == "dashboard":
+    st.sidebar.title("BD Railway")
+    st.sidebar.success("Logged In")
+    if st.sidebar.button("Logout", use_container_width=True):
+        api.logout()
+        st.session_state.phase = "landing"
+        st.session_state.token = ""
+        st.rerun()
+    if st.sidebar.button("Search Trains", use_container_width=True):
+        st.session_state.phase = "search"
+        st.rerun()
+
+    st.title("Dashboard")
+
+    st.subheader("All Trains (Public)")
 
     with st.spinner("Loading trains..."):
         result = api.get_all_trains()
@@ -61,17 +125,30 @@ if not logged_in:
 
         if filtered:
             for t in filtered:
-                st.write(f"**Train {t.get('train_number', '')}** - {t.get('origin_city', '')} to {t.get('destination_city', '')} ({t.get('zone', '')})")
+                with st.expander(f"Train {t.get('train_number', '')} - {t.get('origin_city', '')} to {t.get('destination_city', '')}"):
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        st.write(f"**Number:** {t.get('train_number', '')}")
+                    with c2:
+                        st.write(f"**Zone:** {t.get('zone', '')}")
+                    with c3:
+                        st.write(f"**Opens:** {t.get('opening_time', '')}")
         else:
             st.info("No trains match filter")
 
-else:
+elif phase == "search":
+    st.sidebar.title("BD Railway")
     st.sidebar.success("Logged In")
+    if st.sidebar.button("Dashboard", use_container_width=True):
+        st.session_state.phase = "dashboard"
+        st.rerun()
     if st.sidebar.button("Logout", use_container_width=True):
         api.logout()
+        st.session_state.phase = "landing"
+        st.session_state.token = ""
         st.rerun()
 
-    st.subheader("Search Trains")
+    st.title("Search Trains")
 
     cities = api.cities
     city_names = [c.get("city_name", "") for c in cities] if cities else []
@@ -141,3 +218,17 @@ else:
                 st.warning("No trains found")
         else:
             st.error(result["message"])
+
+    st.divider()
+
+    st.subheader("Railway Website")
+    components.html(
+        """
+        <iframe
+            src="https://eticket.railway.gov.bd/home"
+            style="width:100%; height:500px; border:2px solid #1976d2; border-radius:8px;"
+            frameborder="0">
+        </iframe>
+        """,
+        height=540,
+    )

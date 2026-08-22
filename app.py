@@ -2,8 +2,11 @@ import streamlit as st
 import streamlit.components.v1 as components
 from railway_api import RailwayAPI
 from datetime import datetime, timedelta
+import os
 
 st.set_page_config(page_title="BD Railway E-Ticket", page_icon="train", layout="wide")
+
+turnstile_component = components.declare_component("turnstile", path=os.path.join(os.path.dirname(__file__), "components"))
 
 if "api" not in st.session_state:
     st.session_state.api = RailwayAPI()
@@ -19,6 +22,8 @@ if "current_train" not in st.session_state:
     st.session_state.current_train = None
 if "otp_sent" not in st.session_state:
     st.session_state.otp_sent = False
+if "turnstile_token" not in st.session_state:
+    st.session_state.turnstile_token = None
 
 st.markdown("""<style>
     [data-testid="stSidebar"] {background-color: #0e1117}
@@ -39,17 +44,25 @@ if phase == "login":
         if not st.session_state.otp_sent:
             mobile = st.text_input("Mobile Number", placeholder="01XXXXXXXXX", max_chars=11)
 
-            st.write("**Verify you are human:**")
-            turnstile_token = components.declare_component("turnstile", path="./components")()
+            st.write("**Human Verification:**")
+            turnstile_token = turnstile_component(key="turnstile_login")
+
+            if turnstile_token:
+                st.session_state.turnstile_token = turnstile_token
+
+            if st.session_state.turnstile_token:
+                st.success("Verification complete")
+            else:
+                st.caption("Waiting for verification...")
 
             if st.button("Send OTP", type="primary", use_container_width=True):
                 if not mobile or len(mobile) != 11:
                     st.error("Enter valid 11-digit mobile")
-                elif not turnstile_token:
-                    st.error("Please complete the verification")
+                elif not st.session_state.turnstile_token:
+                    st.error("Please complete the human verification")
                 else:
                     with st.spinner("Sending OTP..."):
-                        result = api.request_otp(mobile, turnstile_token)
+                        result = api.request_otp(mobile, st.session_state.turnstile_token)
                     if result["success"]:
                         st.session_state.otp_sent = True
                         st.session_state.mobile = mobile
@@ -65,7 +78,7 @@ if phase == "login":
             c1, c2 = st.columns(2)
             with c1:
                 if st.button("Verify & Login", type="primary", use_container_width=True):
-                    if len(otp) != 6:
+                    if not otp or len(otp) != 6:
                         st.error("Enter 6-digit OTP")
                     else:
                         with st.spinner("Verifying..."):
@@ -73,22 +86,19 @@ if phase == "login":
                         if result["success"]:
                             st.session_state.phase = "dashboard"
                             st.session_state.otp_sent = False
+                            st.session_state.turnstile_token = None
                             st.rerun()
                         else:
                             st.error(result["message"])
             with c2:
                 if st.button("Resend OTP", use_container_width=True):
-                    turnstile_token = components.declare_component("turnstile", path="./components")()
-                    if turnstile_token:
-                        with st.spinner("Resending..."):
-                            result = api.request_otp(mobile, turnstile_token)
-                        if result["success"]:
-                            st.success("OTP resent!")
-                        else:
-                            st.error(result["message"])
+                    st.session_state.turnstile_token = None
+                    st.session_state.otp_sent = False
+                    st.rerun()
 
             if st.button("Back", use_container_width=True):
                 st.session_state.otp_sent = False
+                st.session_state.turnstile_token = None
                 st.rerun()
 
     with right:

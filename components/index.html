@@ -3,19 +3,48 @@
 <head>
     <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
     <style>
-        body { margin: 0; padding: 10px; font-family: Arial, sans-serif; background: transparent; }
+        body { margin: 0; padding: 5px; background: #0e1117; font-family: Arial, sans-serif; }
+        #status { color: #888; font-size: 12px; margin-top: 4px; }
     </style>
 </head>
 <body>
-    <div id="turnstile" class="cf-turnstile"
-         data-sitekey="0x4AAAAAAB5VTjZ90pUxRuXR"
-         data-callback="onTurnstileSuccess"
-         data-theme="dark">
-    </div>
+    <div id="turnstile-box"></div>
+    <div id="status">Loading...</div>
     <script>
-    function onTurnstileSuccess(token) {
-        window.parent.Streamlit.setComponentValue(token);
-    }
+        var attempts = 0;
+        function tryRender() {
+            attempts++;
+            if (typeof turnstile === 'undefined') {
+                document.getElementById('status').textContent = 'Loading Cloudflare... (' + attempts + ')';
+                if (attempts < 30) setTimeout(tryRender, 500);
+                else document.getElementById('status').textContent = 'Failed to load. Check internet.';
+                return;
+            }
+            document.getElementById('status').textContent = 'Rendered. Waiting for auto-solve...';
+            try {
+                turnstile.render('#turnstile-box', {
+                    sitekey: '0x4AAAAAAB5VTjZ90pUxRuXR',
+                    theme: 'dark',
+                    callback: function(token) {
+                        document.getElementById('status').textContent = 'VERIFIED';
+                        document.getElementById('status').style.color = '#51cf66';
+                        if (window.parent && window.parent.Streamlit && window.parent.Streamlit.setComponentValue) {
+                            window.parent.Streamlit.setComponentValue(token);
+                        }
+                    },
+                    'error-callback': function() {
+                        document.getElementById('status').textContent = 'Error. Please refresh.';
+                        document.getElementById('status').style.color = '#ff6b6b';
+                    }
+                });
+            } catch(e) {
+                document.getElementById('status').textContent = 'Error: ' + e.message;
+            }
+        }
+        if (document.readyState === 'loading')
+            document.addEventListener('DOMContentLoaded', tryRender);
+        else
+            tryRender();
     </script>
 </body>
 </html>

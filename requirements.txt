@@ -1,2 +1,4 @@
 streamlit
 requests
+undetected-chromedriver
+selenium-stealth

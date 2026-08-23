@@ -4,47 +4,75 @@
     <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
     <style>
         body { margin: 0; padding: 5px; background: #0e1117; font-family: Arial, sans-serif; }
-        #status { color: #888; font-size: 12px; margin-top: 4px; }
+        #debug { color: #ff6b6b; font-size: 11px; margin-top: 5px; white-space: pre-wrap; }
+        #turnstile-box { min-height: 65px; }
     </style>
 </head>
 <body>
     <div id="turnstile-box"></div>
-    <div id="status">Loading...</div>
+    <div id="debug">Initializing...</div>
     <script>
-        var attempts = 0;
-        function tryRender() {
-            attempts++;
+        var dbg = document.getElementById('debug');
+        var log = [];
+        function dlog(msg) {
+            log.push(msg);
+            dbg.textContent = log.join('\n');
+        }
+
+        dlog('Script executed');
+
+        function sendToStreamlit(token) {
+            dlog('Sending token to Streamlit...');
+            try {
+                if (window.parent && window.parent.Streamlit) {
+                    window.parent.Streamlit.setComponentValue(token);
+                    dlog('Token sent successfully!');
+                } else {
+                    dlog('window.parent.Streamlit not found, retrying...');
+                    setTimeout(function() { sendToStreamlit(token); }, 500);
+                }
+            } catch(e) {
+                dlog('Error sending: ' + e.message);
+            }
+        }
+
+        function renderWidget() {
+            dlog('Checking turnstile...');
             if (typeof turnstile === 'undefined') {
-                document.getElementById('status').textContent = 'Loading Cloudflare... (' + attempts + ')';
-                if (attempts < 30) setTimeout(tryRender, 500);
-                else document.getElementById('status').textContent = 'Failed to load. Check internet.';
+                dlog('Turnstile not loaded yet. Waiting...');
+                setTimeout(renderWidget, 500);
                 return;
             }
-            document.getElementById('status').textContent = 'Rendered. Waiting for auto-solve...';
+            dlog('Turnstile loaded! Rendering...');
             try {
                 turnstile.render('#turnstile-box', {
                     sitekey: '0x4AAAAAAB5VTjZ90pUxRuXR',
                     theme: 'dark',
                     callback: function(token) {
-                        document.getElementById('status').textContent = 'VERIFIED';
-                        document.getElementById('status').style.color = '#51cf66';
-                        if (window.parent && window.parent.Streamlit && window.parent.Streamlit.setComponentValue) {
-                            window.parent.Streamlit.setComponentValue(token);
-                        }
+                        dlog('VERIFIED! Token length: ' + token.length);
+                        dbg.style.color = '#51cf66';
+                        sendToStreamlit(token);
                     },
-                    'error-callback': function() {
-                        document.getElementById('status').textContent = 'Error. Please refresh.';
-                        document.getElementById('status').style.color = '#ff6b6b';
+                    'error-callback': function(err) {
+                        dlog('Turnstile error: ' + err);
+                        dbg.style.color = '#ff6b6b';
+                    },
+                    'expired-callback': function() {
+                        dlog('Token expired, resetting...');
+                        turnstile.reset('#turnstile-box');
                     }
                 });
+                dlog('Render called. Waiting for solve...');
             } catch(e) {
-                document.getElementById('status').textContent = 'Error: ' + e.message;
+                dlog('Render failed: ' + e.message);
             }
         }
-        if (document.readyState === 'loading')
-            document.addEventListener('DOMContentLoaded', tryRender);
-        else
-            tryRender();
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', renderWidget);
+        } else {
+            renderWidget();
+        }
     </script>
 </body>
 </html>

@@ -1,565 +1,483 @@
+"""
+BD Railway Auto Seat Selector + Email Alerts (Streamlit UI).
+
+Pages (via the sidebar radio -- this replaces the old `__name__`-based routing,
+which never worked because __name__ is always "__main__"):
+  * Website           -- the official site embedded in an iframe
+  * Login             -- mobile + OTP, or paste a Bearer token
+  * Search & Select   -- search trips, view availability, auto-reserve via API
+  * Seat Alerts       -- start/stop the email monitor in a background thread
+  * Console Script    -- the paste-into-DevTools auto-clicker (fallback)
+
+Run:  streamlit run app.py
+"""
+import json
+import threading
+from datetime import datetime, timedelta
+
 import streamlit as st
 import streamlit.components.v1 as components
-from railway_api import RailwayAPI
-from datetime import datetime, timedelta
-import json
-import os
-import threading
-import time
 
-st.set_page_config(page_title="BD Railway Auto Seat Selector", page_icon="train", layout="wide")
+from config import Config
+from monitor import monitor_loop
+from notifier import notifier_from_config
+from railway_api import SEAT_TYPES, RailwayAPI
 
+st.set_page_config(page_title="BD Railway Auto Seat Selector", page_icon="🚆", layout="wide")
+
+# --------------------------------------------------------------------- state
 if "api" not in st.session_state:
     st.session_state.api = RailwayAPI()
     st.session_state.api.handshake()
+    # Auto-login from a token in .env if present.
+    if Config.RAILWAY_AUTH_TOKEN:
+        st.session_state.api.set_auth_token(Config.RAILWAY_AUTH_TOKEN)
 
 api = st.session_state.api
 
-defaults = {
-    "phase": "main",
-    "selected_seats": [],
-    "current_train": None,
-    "otp_sent": False,
-    "turnstile_token": None,
-    "confirmed_seats": [],
-    "gauge": "meter",
-    "mode": "priority",
+_defaults = {
     "preferred": "11,12,13,14",
     "start_seat": 11,
     "num_seats": 4,
+    "gauge": "meter",
+    "mode": "priority",
     "click_mode": "burst",
     "burst_ms": 10,
     "delay_ms": 500,
     "retry_enabled": True,
     "max_retry": 5,
     "retry_delay": 3,
-    "activity_log": [],
-    "chrome_status": "closed",
-    "chrome_url": "",
-    "inject_result": "",
+    "confirmed_seats": [],
+    "search_results": [],
+    "monitor_thread": None,
+    "monitor_stop": None,
+    "monitor_status": [],
+    "monitor_lock": None,
+    "dry_run": True,
 }
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+for k, v in _defaults.items():
+    st.session_state.setdefault(k, v)
 
 
-def log_activity(msg):
-    ts = datetime.now().strftime("%H:%M:%S")
-    st.session_state.activity_log.append(f"[{ts}] {msg}")
+def city_options():
+    cities = api.cities or []
+    names = [c.get("name") for c in cities if c.get("name")]
+    ids = {c.get("name"): str(c.get("city_id")) for c in cities if c.get("name")}
+    return names, ids
 
 
-def get_targeted_seats():
-    max_s = 60 if st.session_state.gauge == "meter" else 100
-    if st.session_state.mode == "priority":
-        try:
-            return [int(x.strip()) for x in st.session_state.preferred.split(",") if x.strip().isdigit() and 1 <= int(x.strip()) <= max_s]
-        except Exception:
-            return []
-    else:
-        st_val = st.session_state.start_seat
-        return list(range(st_val, min(st_val + st.session_state.num_seats, max_s + 1)))
+def resolve_recipient():
+    """Recipient precedence: explicit config -> railway profile email.
+    Cached in session_state so we don't hit the profile endpoint on every rerun
+    (also avoids racing the monitor thread on the shared HTTP session)."""
+    if Config.NOTIFY_EMAIL:
+        return Config.NOTIFY_EMAIL, "config (NOTIFY_EMAIL)"
+    if st.session_state.get("cached_recipient"):
+        return st.session_state.cached_recipient, "railway profile"
+    if api.is_logged_in:
+        prof = api.get_profile()
+        if prof.get("success"):
+            email = RailwayAPI.extract_email(prof["profile"])
+            if email:
+                st.session_state.cached_recipient = email
+                return email, "railway profile"
+    return None, None
 
 
-CLICK_JS = """
-var result = { clicked: [], verified: [], mode: '', error: null };
-
-try {
-    var need = {need};
-    var prList = {pr_list};
-    var seqFrom = {seq_from};
-    var maxS = {max_seats};
-    var isBurst = {is_burst};
-    var delayMs = {delay_ms};
-    var burstMs = {burst_ms};
-
-    function getNum(b) {{
-        var t = (b.getAttribute('title') || b.textContent || '').trim();
-        var m = t.match(/\\d+/);
-        return m ? parseInt(m[0]) : null;
-    }}
-
-    function buildMap() {{
-        var map = new Map();
-        document.querySelectorAll('button.btn-seat.seat-available').forEach(function(b) {{
-            var n = getNum(b);
-            if (n && n >= 1 && n <= maxS) map.set(n, b);
-        }});
-        return map;
-    }}
-
-    function fireClick(b) {{
-        ['mousedown', 'mouseup', 'click'].forEach(function(t) {{
-            b.dispatchEvent(new MouseEvent(t, {{view: window, bubbles: true, cancelable: true, buttons: 1}}));
-        }});
-    }}
-
-    var initial = buildMap();
-    if (!initial.size) {{
-        result.error = 'No available seats found. Make sure you are on the seat selection page.';
-        return result;
-    }}
-
-    var toClick = [];
-    for (var i = 0; i < prList.length && toClick.length < need; i++) {{
-        if (initial.has(prList[i])) toClick.push(prList[i]);
-    }}
-    if (toClick.length < need) {{
-        var from = (seqFrom !== null) ? seqFrom : (prList.length ? Math.max.apply(null, prList) + 1 : 1);
-        for (var n = from; n <= maxS && toClick.length < need; n++) {{
-            if (toClick.indexOf(n) < 0 && initial.has(n)) toClick.push(n);
-        }}
-    }}
-
-    if (!toClick.length) {{
-        result.error = 'Target seats not available!';
-        return result;
-    }}
-
-    result.clicked = toClick;
-    result.mode = isBurst ? 'micro-burst (' + burstMs + 'ms)' : 'sequential (' + delayMs + 'ms)';
-    var gap = isBurst ? burstMs : delayMs;
-    var idx = 0;
-
-    function doNext() {{
-        if (idx >= toClick.length) return;
-        var fresh = buildMap();
-        var btn = fresh.get(toClick[idx]);
-        if (btn) fireClick(btn);
-        idx++;
-        if (idx < toClick.length) setTimeout(doNext, gap);
-    }}
-
-    doNext();
-}} catch(e) {{
-    result.error = e.toString();
-}}
-
-return result;
-"""
-
-
-VERIFY_JS = """
-(function() {{
-    var seats = [];
-    var seen = new Set();
-    var selectors = [
-        'button.btn-seat.seat-selected',
-        'button.btn-seat.selected',
-        'button.btn-seat.active',
-        'button.btn-seat.booked-by-user',
-        'button.btn-seat[class*="selected"]',
-        'button.btn-seat[class*="active"]'
-    ];
-    selectors.forEach(function(sel) {{
-        try {{
-            document.querySelectorAll(sel).forEach(function(b) {{
-                if (seen.has(b)) return;
-                seen.add(b);
-                var t = (b.getAttribute('title') || b.textContent || '').trim();
-                var m = t.match(/\\d+/);
-                if (m) seats.push(parseInt(m[0]));
-            }});
-        }} catch(e) {{}}
-    }});
-    if (!seats.length) {{
-        document.querySelectorAll('button.btn-seat').forEach(function(b) {{
-            var cls = b.className || '';
-            if (cls.indexOf('seat-available') < 0) {{
-                var t = (b.getAttribute('title') || b.textContent || '').trim();
-                var m = t.match(/\\d+/);
-                if (m) seats.push(parseInt(m[0]));
-            }}
-        }});
-    }}
-    return {{ verified: seats.length, seats: seats }};
-}})();
-"""
-
-GRID_JS = """
-function buildSeatGrid(containerId, maxSeats, targetSeats, confirmedSeats) {
-    var c = document.getElementById(containerId);
-    if (!c) return;
-    c.innerHTML = '';
-    var cols = 10;
-    var t = document.createElement('div');
-    t.style.display = 'grid';
-    t.style.gridTemplateColumns = 'repeat(' + cols + ', 1fr)';
-    t.style.gap = '2px';
-    t.style.padding = '4px';
-    for (var s = 1; s <= maxSeats; s++) {
-        var cell = document.createElement('div');
-        cell.textContent = s;
-        cell.style.textAlign = 'center';
-        cell.style.padding = '4px';
-        cell.style.borderRadius = '3px';
-        cell.style.fontSize = '11px';
-        cell.style.fontWeight = '600';
-        if (confirmedSeats.indexOf(s) >= 0) {
-            cell.style.backgroundColor = '#10b981'; cell.style.color = '#fff';
-        } else if (targetSeats.indexOf(s) >= 0) {
-            cell.style.backgroundColor = '#3b82f6'; cell.style.color = '#fff';
-        } else {
-            cell.style.backgroundColor = '#374151'; cell.style.color = '#9ca3af';
-        }
-        t.appendChild(cell);
-    }
-    c.appendChild(t);
-}
-"""
-
-CHROME_DRIVERS = {}
-CHROME_LOCK = threading.Lock()
-
-
-def _launch_chrome(sid):
-    try:
-        import undetected_chromedriver as uc
-        opts = uc.ChromeOptions()
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--start-maximized")
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--window-size=1920,1080")
-        driver = uc.Chrome(options=opts, headless=False)
-        driver.get("https://eticket.railway.gov.bd/login")
-        try:
-            from selenium_stealth import stealth
-            stealth(driver, languages=["en-US", "en"],
-                    vendor="Google Inc.", platform="Win32",
-                    webgl_vendor="Intel Inc.",
-                    renderer="Intel Iris OpenGL Engine",
-                    fix_hairline=True)
-        except ImportError:
-            pass
-        with CHROME_LOCK:
-            CHROME_DRIVERS[sid] = driver
-        st.session_state.chrome_status = "ready"
-        st.session_state.chrome_url = driver.current_url
-        log_activity("Chrome launched - Railway website opened")
-    except Exception as e:
-        st.session_state.chrome_status = "error"
-        st.session_state.inject_result = f"Launch failed: {e}"
-        log_activity(f"Chrome launch failed: {e}")
-
-
-def _get_driver():
-    sid = st.session_state.get("_sid")
-    with CHROME_LOCK:
-        return CHROME_DRIVERS.get(sid)
-
-
-def _close_chrome():
-    sid = st.session_state.get("_sid")
-    with CHROME_LOCK:
-        drv = CHROME_DRIVERS.pop(sid, None)
-    if drv:
-        try:
-            drv.quit()
-        except Exception:
-            pass
-    st.session_state.chrome_status = "closed"
-    st.session_state.confirmed_seats = []
-    st.session_state.chrome_url = ""
-    log_activity("Chrome closed")
-
-
-if "_sid" not in st.session_state:
-    st.session_state._sid = id(st.session_state)
-
-
-def _do_inject():
-    driver = _get_driver()
-    if not driver:
-        st.session_state.inject_result = "Chrome not running!"
+def _auto_select(api, seat_info):
+    """Fetch layout, pick available seats, and reserve (or dry-run)."""
+    n = st.session_state.num_seats
+    with st.spinner("Fetching seat layout…"):
+        layout = api.get_seat_layout(seat_info["trip_id"], seat_info["trip_route_id"])
+    if not layout["success"]:
+        st.error(f"Seat layout failed: {layout['message']}")
+        return
+    seats = RailwayAPI.extract_available_seats(layout["layout"])
+    if not seats:
+        st.warning("Layout loaded but no available seats parsed. "
+                  "The layout schema may differ — check the Console Script fallback.")
         return
 
-    preferred = get_targeted_seats()
-    seq_from = "null" if st.session_state.mode == "priority" else st.session_state.start_seat
-    max_seats = 60 if st.session_state.gauge == "meter" else 100
-    is_burst = "true" if st.session_state.click_mode == "burst" else "false"
+    # Honour the sidebar preference: try preferred seat numbers first.
+    preferred = [x.strip() for x in st.session_state.preferred.split(",") if x.strip()]
 
-    js = CLICK_JS.format(
-        need=st.session_state.num_seats,
-        pr_list=json.dumps(preferred),
-        seq_from=seq_from,
-        max_seats=max_seats,
-        is_burst=is_burst,
-        delay_ms=st.session_state.delay_ms,
-        burst_ms=st.session_state.burst_ms,
+    def _rank(seat):
+        sn = str(seat.get("seat_number", ""))
+        return preferred.index(sn) if sn in preferred else len(preferred)
+
+    seats.sort(key=_rank)
+
+    picked = seats[:n]
+    st.write("Would reserve: " + ", ".join(str(s["seat_number"]) for s in picked))
+
+    if st.session_state.dry_run:
+        st.info("DRY-RUN is on (no real reservation made). Turn it off in the "
+                "sidebar of the Search page to actually hold seats.")
+        return
+
+    with st.spinner("Reserving…"):
+        result = api.reserve_seats(picked, seat_info["trip_route_id"], n)
+    if result["success"]:
+        nums = [str(s["seat_number"]) for s in result["reserved"]]
+        st.session_state.confirmed_seats = nums
+        st.success(f"Reserved {len(nums)} seat(s): {', '.join(nums)}. "
+                  f"Finish payment on the Website tab within the hold window.")
+    else:
+        st.error("Could not reserve the requested number of seats.")
+        for f in result["failed"]:
+            st.caption(f"seat {f['seat'].get('seat_number')}: {f['error']}")
+
+
+# ------------------------------------------------------------------- sidebar
+with st.sidebar:
+    st.title("🚆 BD Railway")
+    st.caption("Auto seat selector + email alerts")
+    st.divider()
+
+    page = st.radio(
+        "Page",
+        ["Website", "Login", "Search & Select", "Seat Alerts", "Console Script"],
+        label_visibility="collapsed",
     )
 
-    max_retry = st.session_state.max_retry if st.session_state.retry_enabled else 1
-    need = st.session_state.num_seats
-    retry_delay = st.session_state.retry_delay
-
-    for attempt in range(1, max_retry + 1):
-        try:
-            click_result = driver.execute_script(js)
-        except Exception as e:
-            st.session_state.inject_result = f"Attempt {attempt}: JS error - {e}"
-            log_activity(f"Attempt {attempt}: JS error - {e}")
-            if attempt < max_retry:
-                time.sleep(retry_delay)
-                continue
-            break
-
-        if click_result and click_result.get("error"):
-            st.session_state.inject_result = f"Attempt {attempt}: {click_result['error']}"
-            log_activity(f"Attempt {attempt}: {click_result['error']}")
-            if attempt < max_retry:
-                time.sleep(retry_delay)
-                continue
-            break
-
-        time.sleep(max(1, len(click_result.get("clicked", [])) * 0.02 + 1))
-
-        try:
-            verify = driver.execute_script(VERIFY_JS)
-        except Exception:
-            verify = {"verified": 0, "seats": []}
-
-        verified = verify.get("verified", 0)
-        seats = verify.get("seats", [])
-        clicked = click_result.get("clicked", []) if click_result else []
-
-        st.session_state.confirmed_seats = seats
-
-        msg = f"Attempt {attempt}/{max_retry}: Clicked {clicked}, Verified {verified} seat(s): {seats}"
-        log_activity(msg)
-
-        if verified >= need:
-            st.session_state.inject_result = f"SUCCESS! {verified} seats selected: {seats}"
-            log_activity(f"SUCCESS! {verified} seats: {seats}")
-            return
-        else:
-            if attempt < max_retry:
-                log_activity(f"Retrying in {retry_delay}s...")
-                time.sleep(retry_delay)
-            else:
-                st.session_state.inject_result = f"{verified}/{need} seats after {max_retry} attempts: {seats}"
-
-
-with st.sidebar:
-    st.title("BD Railway")
-    st.markdown("**Auto Seat Selector**")
     st.divider()
-
-    nav = st.radio("Navigation", ["Website", "Search Trains", "All Trains"], label_visibility="collapsed")
-    st.divider()
-
-    st.subheader("GAUGE TYPE")
-    gauge = st.radio("Gauge", ["Meter (1-60)", "Broad (1-100)"], horizontal=True, key="gauge_radio")
-    st.session_state.gauge = "meter" if "Meter" in gauge else "broad"
-    max_seats = 60 if st.session_state.gauge == "meter" else 100
-
-    st.subheader("SELECTION MODE")
-    mode = st.radio("Mode", ["Priority", "Sequential"], horizontal=True, key="mode_radio")
-    st.session_state.mode = mode.lower()
-
-    if st.session_state.mode == "priority":
-        st.session_state.preferred = st.text_input("Preferred Seats (comma-separated)", value=st.session_state.preferred)
+    if api.is_logged_in:
+        st.success("Logged in")
     else:
-        st.session_state.start_seat = st.number_input("Start Seat (scans upward)", min_value=1, max_value=max_seats, value=st.session_state.start_seat)
+        st.warning("Not logged in")
 
-    sc1, sc2 = st.columns(2)
-    with sc1:
-        st.session_state.num_seats = st.number_input("Seats to Book", min_value=1, max_value=8, value=st.session_state.num_seats)
-    with sc2:
-        if st.session_state.click_mode == "burst":
-            st.session_state.burst_ms = st.slider("Burst Gap (ms)", 5, 100, st.session_state.burst_ms)
-        else:
-            st.session_state.delay_ms = st.slider("Click Delay (ms)", 100, 2000, st.session_state.delay_ms, step=50)
-
-    st.subheader("CLICK MODE")
-    click_mode = st.radio("Click", ["Micro-Burst (10ms)", "Sequential (N ms)"], horizontal=True, key="click_radio")
-    st.session_state.click_mode = "burst" if "Micro" in click_mode else "sequential"
-
-    st.subheader("AUTO-RETRY")
-    st.session_state.retry_enabled = st.checkbox("Enable", value=st.session_state.retry_enabled)
-    if st.session_state.retry_enabled:
-        ar1, ar2 = st.columns(2)
-        with ar1:
-            st.session_state.max_retry = st.number_input("Attempts", 1, 20, st.session_state.max_retry)
-        with ar2:
-            st.session_state.retry_delay = st.number_input("Delay (s)", 1, 30, st.session_state.retry_delay)
-
-    st.divider()
-
-    targeted = get_targeted_seats()
-    confirmed = st.session_state.confirmed_seats
-    max_s = 60 if st.session_state.gauge == "meter" else 100
-
-    grid_html = f"""
-    <div style="background:#1a1d24;padding:6px;border-radius:8px;">
-    <div id="sidebar-grid" style="min-height:40px;"></div>
-    <div style="display:flex;gap:12px;padding:4px 8px;font-size:11px;color:#9ca3af;">
-        <span><span style="display:inline-block;width:10px;height:10px;background:#10b981;border-radius:2px;vertical-align:middle;"></span> Verified</span>
-        <span><span style="display:inline-block;width:10px;height:10px;background:#3b82f6;border-radius:2px;vertical-align:middle;"></span> Targeted</span>
-        <span><span style="display:inline-block;width:10px;height:10px;background:#374151;border-radius:2px;vertical-align:middle;"></span> Available</span>
-    </div>
-    </div>
-    <script>
-    {GRID_JS}
-    buildSeatGrid('sidebar-grid', {max_s}, {targeted}, {confirmed});
-    </script>
-    """
-    st.components.v1.html(grid_html, height=160)
-
-    st.write(f"**Verified:** {len(confirmed)} seat(s)")
-    if confirmed:
-        st.success(f"{', '.join(map(str, confirmed))}")
-
-    st.divider()
-
-    st.subheader("CHROME CONTROL")
-    cs = st.session_state.chrome_status
-    if cs == "closed":
-        if st.button("Launch Chrome & Open Railway", type="primary", use_container_width=True):
-            st.session_state.chrome_status = "launching"
-            st.session_state.confirmed_seats = []
-            st.session_state.inject_result = ""
-            log_activity("Launching Chrome...")
-            t = threading.Thread(target=_launch_chrome, args=(st.session_state._sid,), daemon=True)
-            t.start()
-            st.rerun()
-    elif cs == "launching":
-        st.info("Launching Chrome... please wait")
-        st.rerun()
-    elif cs == "ready":
-        try:
-            driver = _get_driver()
-            if driver:
-                st.session_state.chrome_url = driver.current_url
-        except Exception:
-            pass
-        st.success("Chrome ready")
-        st.caption(f"URL: {st.session_state.chrome_url}")
-
-        if st.button("Inject Auto-Select", type="primary", use_container_width=True):
-            log_activity("Injecting auto-select script...")
-            with st.spinner("Clicking seats..."):
-                _do_inject()
-            st.rerun()
-
-        if st.button("Close Chrome", use_container_width=True):
-            _close_chrome()
-            st.rerun()
-    elif cs == "error":
-        st.error(st.session_state.inject_result)
-        if st.button("Retry Launch", type="primary", use_container_width=True):
-            st.session_state.chrome_status = "launching"
-            log_activity("Retrying Chrome launch...")
-            t = threading.Thread(target=_launch_chrome, args=(st.session_state._sid,), daemon=True)
-            t.start()
-            st.rerun()
-        if st.button("Dismiss", use_container_width=True):
-            st.session_state.chrome_status = "closed"
-            st.rerun()
-
-    if st.session_state.inject_result:
-        r = st.session_state.inject_result
-        if "SUCCESS" in r:
-            st.success(r)
-        else:
-            st.warning(r)
-
-    st.divider()
-
-    st.subheader("ACTIVITY LOG")
-    log_text = "\n".join(st.session_state.activity_log[-15:]) if st.session_state.activity_log else "No activity yet."
-    st.code(log_text, language=None)
+    email_ok = Config.email_ready()
+    st.caption(("✅ Gmail configured" if email_ok else "⚠️ Gmail not configured (.env)"))
 
 
-if nav == "Website":
-    cs = st.session_state.chrome_status
-    if cs == "ready":
-        st.title("Bangladesh Railway - Controlled by Auto Seat Selector")
-        st.info("Chrome is open and controlled by this app. Use the sidebar to inject auto-select.")
-        try:
-            driver = _get_driver()
-            if driver:
-                st.session_state.chrome_url = driver.current_url
-        except Exception:
-            pass
-        st.caption(f"Current page: {st.session_state.chrome_url}")
-    else:
-        st.title("Bangladesh Railway E-Ticket")
-        st.info("Click **Launch Chrome & Open Railway** in the sidebar to start.")
-        st.components.v1.html(
-            '<iframe src="https://eticket.railway.gov.bd" '
-            'style="width:100%;height:85vh;border:none;border-radius:8px;" '
-            'allow="clipboard-read; clipboard-write"></iframe>',
-            height=900,
-            scrolling=False,
+# ==================================================================== WEBSITE
+if page == "Website":
+    st.title("Bangladesh Railway E-Ticket")
+    st.caption("Official site embedded for reference. Booking/payment happens here.")
+    components.html(
+        '<iframe src="https://eticket.railway.gov.bd" '
+        'style="width:100%;height:80vh;border:none;border-radius:8px;" '
+        'allow="clipboard-read; clipboard-write"></iframe>',
+        height=800,
+        scrolling=False,
+    )
+
+# ===================================================================== LOGIN
+elif page == "Login":
+    st.title("Login")
+    st.info(
+        "The site uses a Cloudflare Turnstile challenge that can't be solved here. "
+        "Two ways in:"
+    )
+
+    tab_token, tab_otp = st.tabs(["Paste Bearer token (easiest)", "Mobile + OTP"])
+
+    with tab_token:
+        st.markdown(
+            "1. Log in normally at eticket.railway.gov.bd in your browser.\n"
+            "2. Press **F12 → Network**, click any request, find the "
+            "**Authorization: Bearer …** header.\n"
+            "3. Copy everything after `Bearer ` and paste it below."
         )
-
-elif nav == "Search Trains":
-    st.title("Search Trains")
-
-    cities = api.cities
-    city_names = [c["name"] for c in cities] if cities else []
-    city_ids = [str(c["city_id"]) for c in cities] if cities else []
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        if city_names:
-            from_idx = st.selectbox("From", city_names, key="from_s")
-            from_city = city_ids[from_idx]
-        else:
-            from_city = st.text_input("From City ID")
-    with c2:
-        if city_names:
-            to_idx = st.selectbox("To", city_names, key="to_s")
-            to_city = city_ids[to_idx]
-        else:
-            to_city = st.text_input("To City ID")
-    with c3:
-        tomorrow = datetime.now() + timedelta(days=1)
-        travel_date = st.date_input("Date", value=tomorrow, min_value=datetime.now())
-        date_str = travel_date.strftime("%Y-%m-%d")
-
-    seat_types = {"SHOVAN": 1, "SHOVAN_CHAIR": 2, "SNIGDHA": 3, "TURNTA": 4, "AC_SEAT": 5, "AC_BERTH": 6, "FIRST_CLASS": 7}
-    seat_type_name = st.selectbox("Seat Class", list(seat_types.keys()))
-    seat_type = seat_types[seat_type_name]
-
-    if st.button("Search", type="primary", use_container_width=True):
-        with st.spinner("Searching trains..."):
-            result = api.search_trips(from_city, to_city, date_str, seat_type)
-        if result["success"]:
-            trains = result["trains"]
-            if trains:
-                st.subheader(f"Found {len(trains)} Train(s)")
-                for train in trains:
-                    name = train.get("train_name", train.get("name", "Unknown"))
-                    number = train.get("train_number", train.get("number", ""))
-                    dep = train.get("departure_time", train.get("depart_time", ""))
-                    arr = train.get("arrival_time", train.get("arrive_time", ""))
-                    fare = train.get("fare", train.get("ticket_price", ""))
-                    avail = train.get("available_seats", train.get("seats_available", ""))
-
-                    with st.expander(f"{number} - {name} | Seats: {avail}"):
-                        cc1, cc2, cc3, cc4 = st.columns(4)
-                        with cc1: st.write(f"**Depart:** {dep}")
-                        with cc2: st.write(f"**Arrive:** {arr}")
-                        with cc3: st.write(f"**Fare:** {fare} BDT")
-                        with cc4: st.write(f"**Available:** {avail}")
+        token = st.text_input("Bearer token", type="password",
+                              value=Config.RAILWAY_AUTH_TOKEN or "")
+        if st.button("Use token", type="primary"):
+            api.set_auth_token(token.strip())
+            prof = api.get_profile()
+            if prof.get("success"):
+                email = RailwayAPI.extract_email(prof["profile"]) or "(no email on profile)"
+                st.success(f"Token accepted. Profile email: {email}")
             else:
-                st.warning("No trains found")
-        else:
-            st.error(result["message"])
+                st.error(f"Token set, but profile check failed: {prof.get('message')}")
 
-elif nav == "All Trains":
-    st.title("All Trains")
-    with st.spinner("Loading..."):
-        result = api.get_all_trains()
-    if result["success"]:
-        trains = result["trains"]
-        st.write(f"Total: {len(trains)} trains")
-        c1, c2 = st.columns(2)
-        with c1: f_from = st.text_input("Filter origin", placeholder="e.g. Dhaka")
-        with c2: f_to = st.text_input("Filter destination", placeholder="e.g. Chattogram")
-        filtered = trains
-        if f_from: filtered = [t for t in filtered if f_from.lower() in t.get("origin_city", "").lower()]
-        if f_to: filtered = [t for t in filtered if f_to.lower() in t.get("destination_city", "").lower()]
-        for t in filtered:
-            st.write(f"**Train {t.get('train_number', '')}** - {t.get('origin_city', '')} to {t.get('destination_city', '')} ({t.get('zone', '')})")
+    with tab_otp:
+        st.markdown(
+            "Grab the Turnstile token: **F12 → Network → the `auth/sign-in` "
+            "request → Payload → `cft_response`**, then paste it here."
+        )
+        mobile = st.text_input("Mobile", value=Config.RAILWAY_MOBILE or "", placeholder="01XXXXXXXXX")
+        turnstile = st.text_input("Turnstile token (cft_response)", type="password")
+        if st.button("Send OTP"):
+            res = api.request_otp(mobile.strip(), turnstile.strip())
+            (st.success if res["success"] else st.error)(res["message"])
+        otp = st.text_input("OTP", placeholder="6-digit code")
+        if st.button("Verify OTP", type="primary"):
+            res = api.verify_otp(mobile.strip(), otp.strip())
+            (st.success if res["success"] else st.error)(res["message"])
+
+# =========================================================== SEARCH & SELECT
+elif page == "Search & Select":
+    st.title("Search & Auto-Select Seats")
+
+    if not api.is_logged_in:
+        st.warning("Please log in first (Login page).")
+        st.stop()
+
+    names, ids = city_options()
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        from_city = st.selectbox("From", names, key="from_sel") if names else st.text_input("From city id")
+    with c2:
+        to_city = st.selectbox("To", names, key="to_sel") if names else st.text_input("To city id")
+    with c3:
+        travel_date = st.date_input("Date", value=datetime.now() + timedelta(days=1),
+                                    min_value=datetime.now())
+    with c4:
+        seat_class = st.selectbox("Seat class", list(SEAT_TYPES.keys()), index=2)
+
+    from_id = ids.get(from_city, from_city)
+    to_id = ids.get(to_city, to_city)
+    date_str = travel_date.strftime("%Y-%m-%d")
+    seat_type = SEAT_TYPES[seat_class]
+
+    with st.expander("Selection settings", expanded=True):
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            st.session_state.num_seats = st.number_input(
+                "Seats to reserve", 1, 8, st.session_state.num_seats)
+        with sc2:
+            st.session_state.preferred = st.text_input(
+                "Preferred seat numbers (optional, comma-separated)",
+                value=st.session_state.preferred)
+        with sc3:
+            st.session_state.dry_run = st.checkbox(
+                "Dry-run (don't actually reserve)", value=st.session_state.dry_run)
+        if not st.session_state.dry_run:
+            st.warning("Dry-run is OFF — clicking Auto-select will really hold seats "
+                      "on your account. Finish or cancel payment promptly.")
+
+    if st.button("Search trips", type="primary"):
+        with st.spinner("Searching…"):
+            res = api.search_trips(from_id, to_id, date_str, seat_type)
+        if res["success"]:
+            st.session_state.search_results = res["trains"]
+            if not res["trains"]:
+                st.warning("No trains found for that route/date.")
+        else:
+            st.error(res["message"])
+            st.session_state.search_results = []
+
+    for i, trip in enumerate(st.session_state.search_results):
+        name = RailwayAPI.train_name(trip)
+        seat_infos = RailwayAPI.seat_types_availability(trip)
+        total_online = sum(s["online"] for s in seat_infos)
+        with st.expander(f"{name} — {total_online} online seat(s)", expanded=(i == 0)):
+            for s in seat_infos:
+                cols = st.columns([2, 1, 1, 2])
+                cols[0].write(f"**{s['type']}**")
+                cols[1].write(f"Fare: {s['fare']}")
+                cols[2].write(f"Online: **{s['online']}**")
+                target = cols[3]
+                key = f"sel_{i}_{s['type']}"
+                if s["online"] > 0 and s.get("trip_id") and s.get("trip_route_id"):
+                    if target.button("Auto-select", key=key):
+                        _auto_select(api, s)
+                else:
+                    target.caption("—")
+
+# ================================================================ SEAT ALERTS
+elif page == "Seat Alerts":
+    st.title("Seat Availability Email Alerts")
+
+    if not Config.email_ready():
+        st.error("Gmail isn't configured. Add GMAIL_ADDRESS and GMAIL_APP_PASSWORD "
+                "to your .env file (see .env.example), then restart. Missing: "
+                + ", ".join(Config.missing_email_fields()))
+        st.stop()
+
+    if not api.is_logged_in:
+        st.warning("Log in first so the monitor can search trips.")
+        st.stop()
+
+    names, ids = city_options()
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        a_from = st.selectbox("From", names, key="a_from") if names else st.text_input("From id", key="a_from_t")
+    with c2:
+        a_to = st.selectbox("To", names, key="a_to") if names else st.text_input("To id", key="a_to_t")
+    with c3:
+        a_date = st.date_input("Date", value=datetime.now() + timedelta(days=1),
+                              min_value=datetime.now(), key="a_date")
+    with c4:
+        a_class = st.selectbox("Seat class", list(SEAT_TYPES.keys()), index=2, key="a_class")
+
+    c5, c6, c7 = st.columns(3)
+    with c5:
+        a_train = st.text_input("Train filter (optional)", placeholder="e.g. SUBORNA")
+    with c6:
+        a_interval = st.number_input("Check every (seconds)", 20, 3600,
+                                    Config.POLL_INTERVAL_SECONDS, step=10)
+    with c7:
+        a_realert = st.number_input("Re-alert every (min, 0=once)", 0, 720,
+                                    Config.REALERT_MINUTES, step=5)
+
+    recipient, source = resolve_recipient()
+    if recipient:
+        st.caption(f"Alerts will go to **{recipient}** (from {source}).")
+    else:
+        st.warning("No recipient email found. Set NOTIFY_EMAIL in .env, or make "
+                  "sure your railway profile has an email.")
+
+    running = (
+        st.session_state.monitor_thread is not None
+        and st.session_state.monitor_thread.is_alive()
+    )
+
+    col_start, col_stop = st.columns(2)
+    with col_start:
+        if st.button("▶ Start alerts", type="primary", disabled=running or not recipient):
+            notifier = notifier_from_config(Config)
+            test = notifier.test_connection()
+            if not test["success"]:
+                st.error(f"Gmail login failed: {test['message']}")
+            else:
+                from_id = ids.get(a_from, a_from)
+                to_id = ids.get(a_to, a_to)
+
+                def _city_name(cid):
+                    for c in api.cities:
+                        if str(c.get("city_id")) == str(cid):
+                            return c.get("name", cid)
+                    return cid
+
+                params = {
+                    "from_city": from_id, "to_city": to_id,
+                    "from_name": _city_name(from_id), "to_name": _city_name(to_id),
+                    "date": a_date.strftime("%Y-%m-%d"),
+                    "seat_type": SEAT_TYPES[a_class], "seat_class": a_class,
+                    "train_filter": a_train,
+                }
+                stop_event = threading.Event()
+                status_list = st.session_state.monitor_status
+                status_lock = threading.Lock()
+                st.session_state.monitor_lock = status_lock
+
+                def _status_cb(entry):
+                    # Runs in the monitor thread; guard the shared list so the
+                    # main thread can render it without a "changed size" error.
+                    with status_lock:
+                        status_list.insert(0, entry)
+                        del status_list[25:]
+
+                def _run():
+                    monitor_loop(
+                        api, notifier, recipient, params,
+                        interval=int(a_interval),
+                        realert_minutes=int(a_realert),
+                        stop_event=stop_event,
+                        status_cb=_status_cb,
+                        logger=lambda *a: None,
+                    )
+
+                t = threading.Thread(target=_run, daemon=True)
+                t.start()
+                st.session_state.monitor_thread = t
+                st.session_state.monitor_stop = stop_event
+                st.success("Monitor started. Leave this app running.")
+                st.rerun()
+    with col_stop:
+        if st.button("⏹ Stop", disabled=not running):
+            if st.session_state.monitor_stop:
+                st.session_state.monitor_stop.set()
+            st.session_state.monitor_thread = None
+            st.info("Stopping…")
+            st.rerun()
+
+    st.divider()
+    if running:
+        st.success("● Monitor is running.")
+    else:
+        st.caption("Monitor is stopped.")
+
+    st.subheader("Recent checks")
+    if st.button("Refresh log"):
+        st.rerun()
+    _lock = st.session_state.get("monitor_lock")
+    if _lock:
+        with _lock:
+            _entries = list(st.session_state.monitor_status)
+    else:
+        _entries = list(st.session_state.monitor_status)
+    if _entries:
+        for e in _entries:
+            if e.get("error"):
+                st.error(f"{e['time']} — error: {e['error']}")
+            else:
+                summary = ", ".join(f"{m['train']}: {m['available']}" for m in e["matches"]) or "no matching trains"
+                sent = e.get("alerts_sent") or []
+                line = f"{e['time']} — {summary}"
+                if sent:
+                    st.success(line + f"  ✉️ emailed: {', '.join(sent)}")
+                else:
+                    st.write(line)
+    else:
+        st.caption("No checks yet.")
+
+    st.info("Note: the in-app monitor runs only while this app is open. For an "
+            "always-on watcher, run `python monitor.py` in a terminal (see README).")
+
+# ============================================================ CONSOLE SCRIPT
+elif page == "Console Script":
+    st.title("Console Auto-Clicker (fallback)")
+    st.caption("If the API reserve flow changes, this pastes into the site's "
+              "DevTools console and clicks available seats fast.")
+
+    max_seats = 60 if st.session_state.gauge == "meter" else 100
+    c1, c2 = st.columns(2)
+    with c1:
+        g = st.radio("Gauge", ["Meter (1-60)", "Broad (1-100)"], horizontal=True)
+        st.session_state.gauge = "meter" if "Meter" in g else "broad"
+        m = st.radio("Mode", ["Priority", "Sequential"], horizontal=True)
+        st.session_state.mode = m.lower()
+    with c2:
+        st.session_state.num_seats = st.number_input("Seats to book", 1, 8, st.session_state.num_seats)
+        if st.session_state.mode == "priority":
+            st.session_state.preferred = st.text_input("Preferred seats (comma-separated)",
+                                                      value=st.session_state.preferred)
+        else:
+            st.session_state.start_seat = st.number_input("Start seat", 1, max_seats,
+                                                        st.session_state.start_seat)
+
+    def get_targeted_seats():
+        mx = 60 if st.session_state.gauge == "meter" else 100
+        if st.session_state.mode == "priority":
+            return [int(x.strip()) for x in st.session_state.preferred.split(",")
+                    if x.strip().isdigit() and 1 <= int(x.strip()) <= mx]
+        s = st.session_state.start_seat
+        return list(range(s, min(s + st.session_state.num_seats, mx + 1)))
+
+    def build_click_js():
+        preferred = get_targeted_seats()
+        seq_from = "null" if st.session_state.mode == "priority" else str(st.session_state.start_seat)
+        max_s = 60 if st.session_state.gauge == "meter" else 100
+        need = st.session_state.num_seats
+        js = (
+            "(function(){"
+            f"var need={need};var prList={json.dumps(preferred)};var seqFrom={seq_from};"
+            f"var maxS={max_s};var gap=10;"
+            "function getNum(b){var t=(b.getAttribute('title')||b.textContent||'').trim();"
+            "var m=t.match(/\\d+/);return m?parseInt(m[0]):null;}"
+            "function buildMap(){var map=new Map();"
+            "document.querySelectorAll('button.btn-seat.seat-available').forEach(function(b){"
+            "var n=getNum(b);if(n&&n>=1&&n<=maxS)map.set(n,b);});return map;}"
+            "function fireClick(b){['mousedown','mouseup','click'].forEach(function(t){"
+            "b.dispatchEvent(new MouseEvent(t,{view:window,bubbles:true,cancelable:true,buttons:1}));});}"
+            "var initial=buildMap();"
+            "if(!initial.size){alert('No available seats! Go to the seat selection page.');return;}"
+            "var toClick=[];"
+            "for(var i=0;i<prList.length&&toClick.length<need;i++){if(initial.has(prList[i]))toClick.push(prList[i]);}"
+            "if(toClick.length<need){var from=(seqFrom!==null)?seqFrom:(prList.length?Math.max.apply(null,prList)+1:1);"
+            "for(var n=from;n<=maxS&&toClick.length<need;n++){if(toClick.indexOf(n)<0&&initial.has(n))toClick.push(n);}}"
+            "if(!toClick.length){alert('Target seats not available!');return;}"
+            "var idx=0;function doNext(){if(idx>=toClick.length)return;"
+            "var fresh=buildMap();var btn=fresh.get(toClick[idx]);if(btn)fireClick(btn);"
+            "idx++;if(idx<toClick.length)setTimeout(doNext,gap);}doNext();"
+            "setTimeout(function(){alert('Clicked: '+toClick.join(', '));},toClick.length*gap+500);"
+            "})();"
+        )
+        return js
+
+    js_code = build_click_js()
+    st.warning("Copy the script, open the seat-selection page in the Website tab, "
+              "press F12 → Console, paste, and press Enter.")
+    st.code(js_code, language="javascript")
